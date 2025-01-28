@@ -1,0 +1,12 @@
+[package]
+name = "sniff"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pcap = { version = "2", features = ["capture-stream"] }
+pnet = "0.35.0"
+ratatui = "0.20.1"
+crossterm = "0.28.1"
+dns-lookup = "2.0.4"
+regex = "1.11.1"

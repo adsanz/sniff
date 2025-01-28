@@ -1,0 +1,5 @@
+- refactor and separate into modules
+-- better coding practices
+-- document code
+- network connection topology panel?
+- code revision regarding active conns
