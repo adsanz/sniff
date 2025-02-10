@@ -12,14 +12,14 @@ use pnet::packet::{
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
     Frame, Terminal,
 };
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     net::IpAddr,
-    sync::mpsc::{channel, Receiver},
+    sync::mpsc::{channel, Receiver, Sender},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -51,22 +51,25 @@ enum InputMode {
 enum Message {
     NewConnection(Connection),
     UpdateStats,
+    LogError(String),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum ActivePanel {
     Tcp,
     Udp,
     Ports,
     ResolvedHosts,
     Tree,
+    Errors, // New Error Panel
 }
 
 struct AppState {
     connections: Vec<Connection>,
     port_stats: HashMap<u16, usize>,
-    resolved_hosts: HashMap<IpAddr, String>,
+    resolved_hosts: BTreeMap<IpAddr, String>, // Use BTreeMap for sorted IPs
     connection_tree: HashMap<IpAddr, Vec<Connection>>,
+    errors: Vec<String>, // Error Log
 }
 
 struct App {
@@ -75,29 +78,57 @@ struct App {
     panel_states: Vec<ListState>,
     scroll_positions: Vec<usize>,
     rx: Receiver<Message>,
+    tx: Sender<Message>, // Add sender to App
     source_filter: Option<String>,
     dest_filter: Option<String>,
     input_mode: InputMode,
     input_value: String,
+    collapsed: HashMap<IpAddr, bool>,
 }
 
 impl App {
-    fn new(rx: Receiver<Message>) -> Self {
+    fn new(rx: Receiver<Message>, tx: Sender<Message>) -> Self {
         Self {
             state: AppState {
                 connections: Vec::new(),
                 port_stats: HashMap::new(),
-                resolved_hosts: HashMap::new(),
+                resolved_hosts: BTreeMap::new(),
                 connection_tree: HashMap::new(),
+                errors: Vec::new(),
             },
             active_panel: ActivePanel::Tcp,
-            panel_states: vec![ListState::default(); 5],
-            scroll_positions: vec![0; 5],
+            panel_states: vec![ListState::default(); 6],
+            scroll_positions: vec![0; 6],
             rx,
+            tx,
             source_filter: None,
             dest_filter: None,
             input_mode: InputMode::Normal,
             input_value: String::new(),
+            collapsed: HashMap::new(),
+        }
+    }
+
+    fn toggle_collapse(&mut self) {
+        if self.active_panel == ActivePanel::Tree {
+            if let Some(panel_index) = self.panel_states[5].selected() {
+                // Iterate through the rendered items to find the corresponding source IP
+                let mut current_index = 0;
+                for (source, connections) in &self.state.connection_tree {
+                    // Check if the current index matches the selected index
+                    if current_index == panel_index {
+                        // Toggle the collapsed state for this source IP
+                        *self.collapsed.entry(*source).or_insert(false) ^= true;
+                        return; // Exit the loop after toggling
+                    }
+                    current_index += 1; // Account for the source IP item
+
+                    // If the source IP is not collapsed, account for the connection items
+                    if !self.collapsed.get(source).copied().unwrap_or(false) {
+                        current_index += connections.len();
+                    }
+                }
+            }
         }
     }
 
@@ -197,8 +228,9 @@ impl App {
             ActivePanel::Tcp => 0,
             ActivePanel::Udp => 1,
             ActivePanel::Ports => 2,
-            ActivePanel::ResolvedHosts => 3,
-            ActivePanel::Tree => 4,
+            ActivePanel::Errors => 3,
+            ActivePanel::ResolvedHosts => 4,
+            ActivePanel::Tree => 5,
         };
 
         let list_length = match self.active_panel {
@@ -219,9 +251,10 @@ impl App {
             ActivePanel::Tree => self
                 .state
                 .connection_tree
-                .iter()
-                .map(|(_, conns)| 1 + conns.len())
+                .values()
+                .map(|conns| 1 + conns.len())
                 .sum(),
+            ActivePanel::Errors => self.state.errors.len(), // Error Panel
         };
 
         match direction {
@@ -245,15 +278,26 @@ impl App {
             match msg {
                 Message::NewConnection(conn) => self.handle_connection(conn),
                 Message::UpdateStats => self.update_stats(),
+                Message::LogError(err) => self.log_error(err),
             }
         }
     }
 
     fn handle_connection(&mut self, conn: Connection) {
         *self.state.port_stats.entry(conn.port).or_default() += 1;
-        if !self.state.resolved_hosts.contains_key(&conn.destination) {
-            if let Ok(name) = lookup_addr(&conn.destination) {
-                self.state.resolved_hosts.insert(conn.destination, name);
+        if let std::collections::btree_map::Entry::Vacant(e) =
+            self.state.resolved_hosts.entry(conn.destination)
+        {
+            match lookup_addr(&conn.destination) {
+                Ok(name) => {
+                    e.insert(name);
+                }
+                Err(e) => {
+                    self.log_error(format!(
+                        "Reverse DNS lookup failed for {}: {}",
+                        conn.destination, e
+                    ));
+                }
             }
         }
         self.state
@@ -278,6 +322,13 @@ impl App {
         }
     }
 
+    fn log_error(&mut self, error: String) {
+        self.state.errors.push(error);
+        if self.state.errors.len() > 100 {
+            self.state.errors.remove(0); // Keep the error log bounded
+        }
+    }
+
     fn render<B: Backend>(&mut self, f: &mut Frame<B>) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -299,21 +350,23 @@ impl App {
         let left_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Percentage(33),
-                Constraint::Percentage(33),
-                Constraint::Percentage(34),
+                Constraint::Percentage(25),
+                Constraint::Percentage(25),
+                Constraint::Percentage(25),
+                Constraint::Percentage(25),
             ])
             .split(horizontal_chunks[0]);
 
         let right_chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(30), Constraint::Percentage(70)].as_ref())
+            .constraints([Constraint::Percentage(20), Constraint::Percentage(80)].as_ref())
             .split(horizontal_chunks[1]);
 
         // Render panels
         self.render_tcp_panel(f, left_chunks[0]);
         self.render_udp_panel(f, left_chunks[1]);
         self.render_ports_panel(f, left_chunks[2]);
+        self.render_errors_panel(f, left_chunks[3]); // Error Panel
         self.render_resolved_panel(f, right_chunks[0]);
         self.render_tree_panel(f, right_chunks[1]);
         if self.input_mode != InputMode::Normal {
@@ -329,14 +382,15 @@ impl App {
         area: ratatui::layout::Rect,
         panel_index: usize,
     ) {
-        let is_active = match (self.active_panel, panel_index) {
-            (ActivePanel::Tcp, 0) => true,
-            (ActivePanel::Udp, 1) => true,
-            (ActivePanel::Ports, 2) => true,
-            (ActivePanel::ResolvedHosts, 3) => true,
-            (ActivePanel::Tree, 4) => true,
-            _ => false,
-        };
+        let is_active = matches!(
+            (self.active_panel, panel_index),
+            (ActivePanel::Tcp, 0)
+                | (ActivePanel::Udp, 1)
+                | (ActivePanel::Ports, 2)
+                | (ActivePanel::Errors, 3)
+                | (ActivePanel::ResolvedHosts, 4)
+                | (ActivePanel::Tree, 5)
+        );
 
         let block = Block::default().title(title).borders(Borders::ALL).style(
             Style::default().add_modifier(if is_active {
@@ -354,28 +408,26 @@ impl App {
     }
 
     fn render_tcp_panel<B: Backend>(&self, f: &mut Frame<B>, area: ratatui::layout::Rect) {
-        let items: Vec<ListItem> = self
-            .state
-            .connections
-            .iter()
-            .filter(|c| c.protocol == Protocol::Tcp && self.matches_filters(c))
-            .map(|conn| {
-                ListItem::new(format!(
-                    "{} -> {}:{} ({} bytes)",
-                    conn.source, conn.destination, conn.port, conn.bytes
-                ))
-            })
-            .collect();
-
-        self.render_list(f, items, "TCP Connections", area, 0);
+        self.render_connection_panel(f, area, Protocol::Tcp, "TCP Connections", 0);
     }
 
     fn render_udp_panel<B: Backend>(&self, f: &mut Frame<B>, area: ratatui::layout::Rect) {
+        self.render_connection_panel(f, area, Protocol::Udp, "UDP Connections", 1);
+    }
+
+    fn render_connection_panel<B: Backend>(
+        &self,
+        f: &mut Frame<B>,
+        area: ratatui::layout::Rect,
+        protocol: Protocol,
+        title: &str,
+        panel_index: usize,
+    ) {
         let items: Vec<ListItem> = self
             .state
             .connections
             .iter()
-            .filter(|c| c.protocol == Protocol::Udp && self.matches_filters(c))
+            .filter(|c| c.protocol == protocol && self.matches_filters(c))
             .map(|conn| {
                 ListItem::new(format!(
                     "{} -> {}:{} ({} bytes)",
@@ -384,7 +436,7 @@ impl App {
             })
             .collect();
 
-        self.render_list(f, items, "UDP Connections", area, 1);
+        self.render_list(f, items, title, area, panel_index);
     }
 
     fn render_ports_panel<B: Backend>(&self, f: &mut Frame<B>, area: ratatui::layout::Rect) {
@@ -405,15 +457,14 @@ impl App {
     }
 
     fn render_resolved_panel<B: Backend>(&self, f: &mut Frame<B>, area: ratatui::layout::Rect) {
-        let mut items: Vec<(&IpAddr, &String)> = self.state.resolved_hosts.iter().collect();
-        items.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let list_items: Vec<ListItem> = items
-            .into_iter()
+        let list_items: Vec<ListItem> = self
+            .state
+            .resolved_hosts
+            .iter()
             .map(|(ip, hostname)| ListItem::new(format!("{}: {}", ip, hostname)))
             .collect();
 
-        self.render_list(f, list_items, "Resolved Hosts", area, 3);
+        self.render_list(f, list_items, "Resolved Hosts", area, 4);
     }
 
     fn render_tree_panel<B: Backend>(&self, f: &mut Frame<B>, area: ratatui::layout::Rect) {
@@ -438,7 +489,7 @@ impl App {
                     .collect();
 
                 if filtered_conns.is_empty() {
-                    return Vec::new(); // Return empty vec instead of iterator
+                    return Vec::new();
                 }
 
                 let (active_conns, _): (Vec<&Connection>, Vec<&Connection>) = filtered_conns
@@ -449,37 +500,51 @@ impl App {
                 let total_bytes: u64 = filtered_conns.iter().map(|conn| conn.bytes).sum();
                 let active_count = active_conns.len();
 
-                // Create vec of items instead of chaining iterators
+                let is_collapsed = self.collapsed.get(source).copied().unwrap_or(false);
+
                 let mut items = Vec::new();
                 items.push(ListItem::new(format!(
-                    "Source: {} (Total: {}, Active: {})",
+                    "{} Source: {} (Total: {}, Active: {})",
+                    if is_collapsed { "▶" } else { "▼" },
                     source,
                     self.format_bytes(total_bytes),
                     active_count
                 )));
 
-                // Add connection items
-                items.extend(filtered_conns.into_iter().map(|conn| {
-                    let age = now.saturating_sub(conn.last_seen);
-                    let status = if age < 10 {
-                        "🟢 ACTIVE".to_string()
-                    } else {
-                        format!("⚫ INACTIVE ({}s)", age)
-                    };
-                    ListItem::new(format!(
-                        "  └─ {}:{} ({}) [{}]",
-                        conn.destination,
-                        conn.port,
-                        self.format_bytes(conn.bytes),
-                        status
-                    ))
-                }));
+                if !is_collapsed {
+                    items.extend(filtered_conns.into_iter().map(|conn| {
+                        let age = now.saturating_sub(conn.last_seen);
+                        let status = if age < 10 {
+                            "🟢 ACTIVE".to_string()
+                        } else {
+                            format!("⚫ INACTIVE ({}s)", age)
+                        };
+                        ListItem::new(format!(
+                            "  └─ {}:{} ({}) [{}]",
+                            conn.destination,
+                            conn.port,
+                            self.format_bytes(conn.bytes),
+                            status
+                        ))
+                    }));
+                }
 
-                items // Return Vec<ListItem> consistently
+                items
             })
             .collect();
 
-        self.render_list(f, items, "Connection Tree", area, 4);
+        self.render_list(f, items, "Connection Tree", area, 5);
+    }
+
+    fn render_errors_panel<B: Backend>(&self, f: &mut Frame<B>, area: ratatui::layout::Rect) {
+        let items: Vec<ListItem> = self
+            .state
+            .errors
+            .iter()
+            .map(|err| ListItem::new(err.clone()).style(Style::default().fg(Color::Red)))
+            .collect();
+
+        self.render_list(f, items, "Errors", area, 3);
     }
 }
 
@@ -491,7 +556,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     let (tx, rx) = channel();
-    let mut app = App::new(rx);
+    let app_tx = tx.clone(); // Clone for passing to App
+    let mut app = App::new(rx, app_tx);
 
     // Get all available network devices
     let devices = Device::list().unwrap_or_default();
@@ -499,34 +565,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Spawn a capture thread for each device
     for device in devices {
         let tx_clone = tx.clone();
-        thread::spawn(move || {
-            if let Ok(cap) = Capture::from_device(device) {
-                if let Ok(mut cap) = cap
+        let app_tx_clone = app.tx.clone(); // Clone for error reporting
+        thread::spawn(move || match Capture::from_device(device) {
+            Ok(cap) => {
+                match cap
                     .promisc(true)
                     .snaplen(96)
                     .buffer_size(16 * 1024 * 1024)
-                    .timeout(1)
+                    .timeout(10)
                     .open()
                 {
-                    loop {
+                    Ok(mut cap) => loop {
                         match cap.next_packet() {
                             Ok(packet) => {
-                                if let Some(conn) = process_packet(&packet) {
+                                if let Some(conn) = process_packet(&packet, &app_tx_clone) {
                                     let _ = tx_clone.send(Message::NewConnection(conn));
                                 }
                             }
                             Err(pcap::Error::TimeoutExpired) => continue,
-                            Err(_) => break,
+                            Err(e) => {
+                                let _ = app_tx_clone.send(Message::LogError(format!(
+                                    "Packet capture error: {}",
+                                    e
+                                )));
+                                break;
+                            }
                         }
+                    },
+                    Err(e) => {
+                        let _ = app_tx_clone
+                            .send(Message::LogError(format!("Failed to open capture: {}", e)));
                     }
                 }
+            }
+            Err(e) => {
+                let _ = app_tx_clone.send(Message::LogError(format!(
+                    "Failed to create capture: {}",
+                    e
+                )));
             }
         });
     }
 
     let tx_clone = tx.clone();
     thread::spawn(move || loop {
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(100));
         let _ = tx_clone.send(Message::UpdateStats);
     });
 
@@ -574,6 +657,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         KeyCode::Char('3') => app.active_panel = ActivePanel::Ports,
                         KeyCode::Char('4') => app.active_panel = ActivePanel::ResolvedHosts,
                         KeyCode::Char('5') => app.active_panel = ActivePanel::Tree,
+                        KeyCode::Char('6') => app.active_panel = ActivePanel::Errors, // Error Panel
                         KeyCode::Char('s') => {
                             app.input_mode = InputMode::Source;
                             app.input_value.clear();
@@ -588,6 +672,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         KeyCode::Up => app.scroll(Direction::Horizontal),
                         KeyCode::Down => app.scroll(Direction::Vertical),
+                        KeyCode::Enter => app.toggle_collapse(),
                         _ => {}
                     },
                     _ => {}
@@ -612,43 +697,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // Packet processing
-
-fn process_packet(packet: &pcap::Packet) -> Option<Connection> {
+fn process_packet(packet: &pcap::Packet, tx: &Sender<Message>) -> Option<Connection> {
     if let Some(ethernet) = EthernetPacket::new(packet.data) {
         if let Some(ip) = Ipv4Packet::new(ethernet.payload()) {
             match ip.get_next_level_protocol() {
-                IpNextHeaderProtocols::Tcp => process_tcp_packet(&ip),
-                IpNextHeaderProtocols::Udp => process_udp_packet(&ip),
+                IpNextHeaderProtocols::Tcp => process_ip_packet(&ip, Protocol::Tcp),
+                IpNextHeaderProtocols::Udp => process_ip_packet(&ip, Protocol::Udp),
                 _ => None,
             }
         } else {
+            let _ = tx.send(Message::LogError("Invalid IPv4 packet".into()));
             None
         }
     } else {
+        let _ = tx.send(Message::LogError("Invalid Ethernet packet".into()));
         None
     }
 }
 
-fn process_tcp_packet(ip: &Ipv4Packet) -> Option<Connection> {
-    TcpPacket::new(ip.payload()).map(|tcp| Connection {
-        source: IpAddr::V4(ip.get_source()),
-        destination: IpAddr::V4(ip.get_destination()),
-        port: tcp.get_destination(),
-        protocol: Protocol::Tcp,
-        bytes: ip.get_total_length() as u64,
-        last_seen: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
-    })
-}
+fn process_ip_packet(ip: &Ipv4Packet, protocol: Protocol) -> Option<Connection> {
+    let (source, destination, port) = match protocol {
+        Protocol::Tcp => {
+            if let Some(tcp) = TcpPacket::new(ip.payload()) {
+                (
+                    IpAddr::V4(ip.get_source()),
+                    IpAddr::V4(ip.get_destination()),
+                    tcp.get_destination(),
+                )
+            } else {
+                return None;
+            }
+        }
+        Protocol::Udp => {
+            if let Some(udp) = UdpPacket::new(ip.payload()) {
+                (
+                    IpAddr::V4(ip.get_source()),
+                    IpAddr::V4(ip.get_destination()),
+                    udp.get_destination(),
+                )
+            } else {
+                return None;
+            }
+        }
+    };
 
-fn process_udp_packet(ip: &Ipv4Packet) -> Option<Connection> {
-    UdpPacket::new(ip.payload()).map(|udp| Connection {
-        source: IpAddr::V4(ip.get_source()),
-        destination: IpAddr::V4(ip.get_destination()),
-        port: udp.get_destination(),
-        protocol: Protocol::Udp,
+    Some(Connection {
+        source,
+        destination,
+        port,
+        protocol,
         bytes: ip.get_total_length() as u64,
         last_seen: SystemTime::now()
             .duration_since(UNIX_EPOCH)
